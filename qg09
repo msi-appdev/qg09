@@ -1,0 +1,410 @@
+#!/usr/bin/perl
+#
+# qg09
+#
+# Ben L. 12-9-2009
+#
+use strict;
+use warnings;
+our $VERSION = '1.0.7';
+use File::Basename;
+use Getopt::Long;
+use Env qw(GAUSS_SCRDIR HOME HOSTNAME USER PWD);
+
+my @default = (
+    'help'      => '',
+    'time'      => "5:00:00",
+    'proc'      => 1,
+    'nodes'     => 1,
+    'run'       => 'yes',
+    'email'     => 'never',
+    'mem'       => '1gb',
+    'scratch'   => 'scratch',
+    'batchsize' => 1,
+    'membuffer' => 100,
+    'module'    => 'gaussian/g09.a02',
+    'queue'     => '',
+    'maxproc'   => 4,
+    'maxnodes'  => 32,
+    'maxmem'    => 8000,
+    'maxtime'   => 300,
+    'scratchsp' => 'scratch',
+    'additional_pbs_resource' => '',
+    'extra_pbs_options' => '',
+    'use_linda' => 'Y',
+);
+
+my @read_in = read_rc_files();
+
+my %options = ( @default, @read_in );
+
+# Set Defaults
+# Will eventually change to hash.
+#
+my $time                    = $options{'time'};
+my $proc                    = $options{'proc'};
+my $nodes                   = $options{'nodes'};
+my $run                     = $options{'run'};
+my $email                   = $options{'email'};
+my $mem                     = $options{'mem'};
+my $scratch                 = $options{'scratch'};
+my $defmem                  = $options{'mem'};
+my $batchsize               = $options{'batchsize'};
+my $membuffer               = $options{'membuffer'};
+my $module                  = $options{'module'};
+my $queue                   = $options{'queue'};
+my $extra_pbs_options       = $options{'extra_pbs_options'};
+my $additional_pbs_resource = $options{'additional_pbs_resource'}; 
+my $use_linda               = $options{'use_linda'};
+
+my $starttime = time();
+
+# system settings
+my $MaxProcPerNode = $options{'maxproc'};
+my $MaNodes        = $options{'maxnodes'};
+my $MaxMem         = $options{'maxmem'};
+my @scratch_spaces = split( /:/mx, $options{'scratchsp'} );
+my $HourLimit      = $options{'maxtime'};
+
+my ($PROGRAM) = basename($0);
+
+my ($scrdir);
+my ( $result, $dscrdir );
+my ( $hours, $mins, $secs );
+my @files;
+my ( $units, $MBmem );
+
+if ( !@ARGV ) {
+    Usage();
+}
+
+$result = GetOptions(
+    'h|help'        => \$options{'help'},
+    'b|batchsize=i' => \$batchsize,
+    'e|email=s'     => \$email,
+    'l|additional_pbs_resource=s' => \$additional_pbs_resource,
+    'm|mem=s'       => \$mem,
+    'n|nodes=i'     => \$nodes,
+    'p|proc=i'      => \$proc,
+    'q|queue=s'     => \$queue,
+    'r|run=s'       => \$run,
+    's|scratch=s'   => \$scratch,
+    't|time=s'      => \$time,
+    'u|use_linda=s' => \$use_linda,
+    'x|extra_pbs_options=s' => \$extra_pbs_options,
+) or Usage();
+
+if ( $options{'help'} ) {
+    Usage();
+}
+
+## check if input is valid
+
+if ( defined $GAUSS_SCRDIR ) {
+    $scrdir = $GAUSS_SCRDIR;
+}
+
+# check run usage
+if ( $run ne "yes" && $run ne "no" ) {
+    print "\nInvalid run option: $run\n";
+    Usage();
+}
+
+# check email notification usage
+if ( $email ne 'never' && $email ne 'end' ) {
+    print "\nInvalid email notification option: $email\n";
+    Usage();
+}
+
+# check scratch space
+my $correct_scratch;
+foreach my $scr (@scratch_spaces) {
+    if ( $scr eq $scratch ) { $correct_scratch++ }
+}
+if ( !$correct_scratch ) {
+    print "Invalid scratch space chosen\n";
+    Usage();
+}
+
+( $hours, $mins, $secs ) = split( /:/xm, $time );
+
+#print "$hours : $mins : $secs\n";
+if ( $hours > $HourLimit ) {
+    print
+"Wallclock time cannot exceed $HourLimit hours, setting to $HourLimit:00:00\n";
+    $time = "$HourLimit:00:00";
+}
+
+# check that an input file was specified
+if ( $ARGV[0] ) {
+    @files = @ARGV;
+}
+else {
+    print "An input file must be specified\n";
+    Usage();
+}
+
+# check memory allocation, remove the units and default to mb
+$units = substr( $mem, -2 );
+$_ = $units;
+if (m/gb/ixm) {
+    $MBmem = substr( $mem, 0, -2 );
+    $MBmem *= 1000;
+}
+elsif (m/mb/ixm) {
+    $MBmem = substr( $mem, 0, -2 );
+}
+else {
+    $MBmem = $mem;
+}
+
+my $safemem = $MBmem - $membuffer;
+$MBmem*=$nodes;
+
+if ( $scratch eq 'local' ) { $scratch = "scratch" }
+
+my $resources = {
+    'mem'     => $MBmem,
+    'nodes'   => $nodes,
+    'procs'   => $proc,
+    'workdir' => $PWD,
+    'queue'   => $queue
+};
+
+
+
+if ( @files == 1 ) {
+    my $file      = $files[0];
+    my $scr       = q{/} . $scratch . '/$USER/$PBS_JOBID';
+    $$resources{'scr'} = $scr;
+    my $batchfile = $file;
+    $batchfile =~ s/(.*)\..*/$1/xm;
+    fix_input( $file, 'Mem',         "$safemem" . 'mb' );
+    fix_input( $file, 'NProcShared', $proc );
+    my $job = MakeGaussianJob( $file, $resources, $module, $scr );
+    submit_pbs_job( $resources, $batchfile, $job );
+}
+else {
+
+    my $nbatch = int( @files / $batchsize );
+    my $remain = @files % $batchsize;
+    for my $ibatch ( 1 .. $nbatch ) {
+        my @jobs;
+
+        for my $ijob ( 1 .. $batchsize ) {
+            my $file = $files[ ( $ibatch - 1 ) * $batchsize + $ijob - 1 ];
+            my $scr = q{/} . $scratch . '/$USER/$PBS_JOBID' . q{/} . $ijob;
+            $$resources{'scr'} = $scr;
+            fix_input( $file, 'Mem',         "$safemem" . 'mb' );
+            fix_input( $file, 'NProcShared', $proc );
+            my $job = MakeGaussianJob( $file, $resources, $module, $scr );
+            push( @jobs, $job );
+        }
+        my $batchfile = "GaussianBatch_" . $ibatch . '_' . $starttime;
+        submit_pbs_job( $resources, $batchfile, @jobs );
+    }
+
+    my @jobs;
+    for my $ijob ( 1 .. $remain ) {
+
+        my $file = $files[ $nbatch * $batchsize + $ijob - 1 ];
+        my $scr  = q{/} . $scratch . '/$USER/$PBS_JOBID' . q{/} . $ijob;
+
+        fix_input( $file, 'Mem',         "$safemem" . 'mb' );
+        fix_input( $file, 'NProcShared', $proc );
+        my $job = MakeGaussianJob( $file, $resources, $module, $scr );
+        push( @jobs, $job );
+    }
+    if ($remain) {
+        my $batchfile = "GaussianBatch_" . ( $nbatch + 1 ) . '_' . $starttime;
+        submit_pbs_job( $resources, $batchfile, @jobs );
+    }
+
+}
+
+exit 0;
+
+## END OF MAIN PROGRAM ##
+
+sub MakeGaussianJob {
+    my ( $file, $resources, $module, $scratch ) = @_;
+    my $input = $file;
+    my $bfile = $file;
+    $bfile =~ s/(.*)\..*/$1/xm;
+    my $output  = $bfile . ".out";
+    my $workdir = $$resources{'workdir'};
+    my $job =
+        "cd $workdir" . "\n"
+      . "mkdir -p $scratch  \n"
+      . "export GAUSS_SCRDIR=$scratch  \n"
+      . "module load $module  \n";
+      if ($use_linda) {
+        $job.="fix_input $input  \n";
+      } 
+      $job.=
+        "/usr/bin/time g09 < $input >& $output  \n"
+      . "rm $scratch/*.rwf  \n" . "\n";
+    return $job;
+}
+
+sub submit_pbs_job {
+    my ( $resources, $file, @jobs ) = @_;
+    my $bfile = $file;
+
+    my $qfile = $bfile . ".pbs";
+    my $qerr  = $bfile . ".e";
+    my $qout  = $bfile . ".o";
+
+    my $queue = $$resources{'queue'};
+    my $nodes = $$resources{'nodes'};
+    my $mem =   $$resources{'mem'};
+
+    #create PBS submit file
+    my $header =
+        "#!/bin/bash -l\n" . "#\n"
+      . "# Job: $file\n" . "#\n" . "#\n"
+      . "# qg09 version $VERSION\n" . "#\n"
+      . "# To submit this script to the queue type:\n"
+      . "#    qsub $qfile\n" . "#\n";
+
+    my $pbs_resources;
+    if ( $email eq "end" ) {
+        $pbs_resources = "#PBS -m e\n";
+    }
+    else {
+        $pbs_resources = "#PBS -m n\n";
+    }
+
+    my $extra_options = '';    
+
+    if ($extra_pbs_options){
+      $extra_options = $extra_pbs_options . ':';
+    }
+
+    if ($additional_pbs_resource){
+      $pbs_resources .= "#PBS -l $additional_pbs_resource\n";
+    }
+
+    $pbs_resources .=
+        "#PBS -l nodes=$nodes:$extra_options"."ppn=$proc\n"
+      . "#PBS -l walltime=$time\n"
+      . "#PBS -l mem=$mem" . "mb\n"
+      . "#PBS -e $qerr\n"
+      . "#PBS -o $qout\n"
+      . "#PBS -q $queue\n" . "#\n\n"
+      . "cd \$PBS_O_WORKDIR\n\n";
+
+    if ($nodes > 1){
+      $pbs_resources .= 'uniq $PBS_NODEFILE | xargs -I {} ssh {} mkdir -p ' . $$resources{'scr'} . "\n"; 
+      #not sure why i did not just use pbsdsh ...  must come back to this
+    }
+
+    open( my $submit_fh, '>', "$qfile" )
+      or die "Failed to open PBS file: $qfile\n";
+    print {$submit_fh} $header, $pbs_resources;
+    foreach my $job (@jobs) {
+        print {$submit_fh} $job;
+    }
+    close($submit_fh) or die "Failed to close PBS file: $qfile\n";
+
+    if ( $run eq "no" ) {
+        print "The queue script $qfile has been created\n";
+        print "To run the calculation type: qsub $qfile\n";
+    }
+    elsif ( $run eq "yes" ) {
+        print "The calculation $qfile has been submitted\n";
+        system("qsub $qfile");
+    }
+    return 1;
+}
+
+sub fix_input {
+
+    my ( $file, $resource, $value ) = @_;
+
+    my $replacement = q{%} . $resource . q{=} . $value;
+
+    my $replaced;
+
+    open( 'INPUT', '<', $file ) or die "Failed to open input file: $file \n";
+    my @input = (<INPUT>);
+    close INPUT or die "Failed to close input file: $file \n";
+
+    for (@input) {
+        if ( $_ =~ s/\%$resource.*/$replacement/ixm ) { $replaced++; }
+    }
+
+    open( 'OUTPUT', '>', $file ) or die "Failed to open input file: $file \n";
+    if ( !$replaced ) {
+        print OUTPUT $replacement, "\n";
+    }
+    for (@input) {
+        print OUTPUT $_;
+    }
+    close OUTPUT or die "Failed to close input file: $file \n";
+    return 1;
+}
+
+sub read_rc_files {
+    my @keyvalue = ();
+    foreach my $file ( $0 . 'rc', "$HOME/.qg09rc", $PWD . '/qg09rc' ) {
+        if ( -e $file ) {
+            open( my $rc_fh, '<', $file )
+              or die "Failed to open configuration file: $file \n";
+            @keyvalue = ( @keyvalue, read_config($rc_fh) );
+            close $rc_fh or die "Failed to close rc file: $file \n";
+        }
+    }
+    return @keyvalue;
+}
+
+sub read_config {
+    my ($rc_fh) = @_;
+    my @keyvalue;
+    while ( my $line = <$rc_fh> ) {
+        $line =~ s/#.*//mx;    # erase comments
+        next if $line =~ /^(\s)*$/mx;    # skip blank lines
+        my @parts = ( $line =~ /\S+/gmx );
+        push( @keyvalue, $parts[0] );
+        push( @keyvalue, $parts[1] );
+    }
+    return @keyvalue;
+}
+
+sub Usage {
+ 
+    print <<"EOF";
+
+    qg09 Version $VERSION 
+
+    USAGE:
+      $PROGRAM [h b e l m n p q r s t x] <input file>
+
+      options:
+
+        -h prints the help menu
+        -b [$batchsize] the number of files in each batch job
+        -e [$email] email notification (options: end or never)
+        -l [$additional_pbs_resource] addition to PBS resource list
+        -m [$mem] memory used per node 
+        -n [$nodes] the number of nodes used
+        -p [$proc] the number of processors used per node
+        -q [$queue] the queue to submit the job
+        -r [$run] submit the job? (options: yes or no)
+        -s [$scratch] scratch space to use (options: local, scratch1, scratch2)
+        -t [$time] the amount of wall clock time (format: hh:mm:ss)
+        -u [$use_linda] use Linda-parallel version?
+        -x [$extra_pbs_options] additional PBS node features required
+
+      notes:
+       
+        Input files will be modified to match requested resources for job. 
+        Jobs will use $defmem memory per processor if not specified.
+         
+        Machine-specific options have been set in:
+          $0rc 
+
+EOF
+
+    exit 1;
+}

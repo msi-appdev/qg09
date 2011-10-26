@@ -1,0 +1,36 @@
+
+qg09 is a script to run Gaussian09 jobs.  
+
+qg09 :             script
+fix_input.itasca : an example script to set the nodes at runtime for LINDA-
+                   parallel Gaussian.
+README:            this file
+
+
+
+Below is an example qg09rc file.  This can be placed in the same directory as 
+qg09 to hold the system default settings.
+
+
+#user defaults
+time         5:00:00
+proc         8 
+nodes        1
+run          yes
+email        never
+scratch      scratch1 
+batchsize    1
+membuffer    100                    
+mem          15gb                   # amount of memory requested by PBS 
+module       gaussian/g09.a02
+queue        haha 
+
+#system settings
+scratchsp    scratch1:scratch2:scratch3:scratch4
+maxmem       15100 
+maxtime      24 
+maxnodes     32
+maxproc      8
+
+
+
