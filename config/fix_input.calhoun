@@ -1,0 +1,39 @@
+#!/usr/bin/perl
+use strict;
+
+# This is a copy of the FixInput function in qg09.
+# Gaussian09 currently does not have an environment variable or
+# other switch to start a Linda-parallel job except Default.Route,
+# which could cause collisions when multiple jobs were run in the
+# same directory.
+
+my $status_code = 0;
+
+if ( $#ARGV != 0 ) { $status_code = 1 }
+
+my ($file) = @ARGV;
+
+my $resource = '%LindaWorkers='
+  . join( ',', ( `uniq $ENV{'PBS_NODEFILE'}` =~ /[^\n]+/g ) );
+
+my $replaced;
+
+open( INPUT, "<", $file );
+my @input = (<INPUT>);
+close INPUT;
+
+for (@input) {
+    if ( $_ =~ s/\%LindaWorkers.*/$resource/i ) { $replaced++; }
+}
+
+open( OUTPUT, ">", $file );
+if ( !$replaced ) {
+    print OUTPUT $resource, "\n";
+}
+for (@input) {
+    print OUTPUT $_;
+}
+close OUTPUT;
+
+exit($status_code)
+
